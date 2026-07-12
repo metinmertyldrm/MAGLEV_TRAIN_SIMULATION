@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-MAGLEV TRAIN VISUAL SIMULATION - V12 FINAL DEMO PACKAGE
+MAGLEV TRAIN VISUAL SIMULATION - V13 PHYSICS MODEL
 ------------------------------------------------
 Bu sürümün amacı: sadece çalışan bir demo değil, yeni başlayan birinin de
 hangi ayarın neyi değiştirdiğini rahat okuyabildiği kullanıcı dostu bir
 simülasyon ekranı sunmak.
 
-V12 paketi; final demo, örnek veri, senaryo kayıtları, raporlama ve Unity/Unreal geçiş dokümanlarıyla birlikte gelir.
+V13; V12 arayüzünü ve raporlama özelliklerini korurken dikey kaldırma hareketini
+Newton'un ikinci yasası, elektromıknatıs kuvveti ve bobin elektrik denklemiyle hesaplar.
 
 Çalıştırma:
     py maglev_pygame_v12_final_demo.py
@@ -46,8 +47,19 @@ import pygame
 # ============================================================
 
 APP_TITLE = "Maglev Train Visual Simulation"
-VERSION = "v12.0-final-demo"
+VERSION = "v13.0-physics-model"
 FPS = 60
+
+# Dikey hareket modeli sabitleri
+#
+# Trenin raydan yukarı doğru olan boşluğu ``gap`` ile ifade edilir. Manyetik
+# kuvvet yukarı, yerçekimi aşağı yöndedir. Kuvvet modeli, küçük hava aralıkları
+# için kullanılan F = k * I_eff^2 / gap^2 yaklaşımını temel alır.
+GRAVITY_MPS2 = 9.80665
+MAGNETIC_FORCE_CONSTANT = 2.75e-5  # N*m^2/A^2
+COIL_INDUCTANCE_H = 0.12
+VERTICAL_DAMPING_NS_M = 0.42
+MAX_MAGNETIC_FORCE_N = 12.0
 
 START_W, START_H = 1280, 720
 MIN_W, MIN_H = 1050, 640
@@ -548,6 +560,12 @@ class MaglevSim:
         self.thermal_derate = 1.0
         self.saturation_ratio = 0.0
         self.protection_active_time = 0.0
+        # Fizik tabanlı dikey model telemetrisi
+        self.command_current = self.current
+        self.coil_voltage = 0.0
+        self.magnetic_force = 0.0
+        self.gravity_force = 0.0
+        self.vertical_accel = 0.0
 
     def hit(self):
         self.disturb = 0.18
@@ -590,20 +608,15 @@ class MaglevSim:
         err = measured - target
 
         # ----------------------------------------------------
-        # Daha gerçekçi kararlılık modeli
+        # PID + fizik tabanlı kaldırma modeli
         # ----------------------------------------------------
-        # Önceki sürüm bilinçli olarak çok sakin tutulmuştu; bu yüzden kullanıcı bütün
-        # değerleri uç değerlere çekse bile tren çoğunlukla kararlı kalıyordu. Burada
-        # kötü PID, zayıf güç, yüksek sensör gürültüsü, düşük stabilizer ve hızlı itki
-        # değerleri birlikte büyüyen bir "instability_index" oluşturur. Bu indeks hem
-        # fizikte salınım üretir hem de skor/durum etiketlerini etkiler.
         self.integral = clamp(self.integral + err * dt, -6.0, 6.0)
         derivative = (err - self.prev_err) / max(dt, 1e-5)
         derivative = clamp(derivative, -160, 160)
         self.prev_err = err
 
         mass_load = mass / 0.15
-        # V11 güç modeli: yük altında voltaj düşümü + termal koruma + akım limiti.
+        # Güç modeli: yük altında voltaj düşümü + termal koruma + akım limiti.
         self.bus_voltage = max(1.0, p.voltage - p.voltage_sag * max(0.0, self.current))
         raw_power_limit = min(p.current_limit, self.bus_voltage / max(p.resistance, 0.1))
         if self.temp <= p.thermal_limit:
@@ -613,8 +626,21 @@ class MaglevSim:
             self.thermal_derate = clamp(1.0 - (self.temp - p.thermal_limit) / 20.0, 0.05, 1.0)
             self.protection_active_time += dt
         power_limit = max(0.0, raw_power_limit * self.thermal_derate)
-        # Hedef mesafe, kütle ve düşük stabilizer arttıkça yaklaşık gereken akım yükselir.
-        required_current = 1.65 + 0.95 * (mass_load - 1.0) + 0.16 * max(0.0, target - 8.0) + 0.15 * max(0.0, 0.8 - p.guide)
+
+        # Hedef boşlukta ağırlığı dengelemek için gereken akım fizik denkleminden
+        # hesaplanır. Doyum modeli nedeniyle bobin akımı ile efektif akım farklıdır.
+        target_gap_m = max(target, MIN_GAP_MM) / 1000.0
+        required_effective_current = target_gap_m * math.sqrt(
+            mass * GRAVITY_MPS2 / max(MAGNETIC_FORCE_CONSTANT, 1e-12)
+        )
+        sat_i = max(0.2, p.saturation_current)
+        effective_ratio = required_effective_current / sat_i
+        if effective_ratio < 0.995:
+            required_current = required_effective_current / math.sqrt(max(1e-6, 1.0 - effective_ratio ** 2))
+        else:
+            # İstenen kuvvet bu doyum modeliyle üretilemiyorsa büyük bir gereksinim
+            # değeri bırakılır; akım limiti ve durum sistemi bunu raporlar.
+            required_current = power_limit + required_effective_current
         power_shortage = max(0.0, (required_current - power_limit) / max(required_current, 0.1))
         underdamped = max(0.0, (p.kp - 360.0) / 420.0) + max(0.0, (2.2 - p.kd) / 2.2)
         excessive_damping = max(0.0, (p.kd - 12.0) / 8.0)
@@ -627,30 +653,69 @@ class MaglevSim:
             0.0, 4.0
         )
 
-        # PID kontrol etkisi. Kp hedefe döndürür, Kd salınımı frenler. Çok yüksek Kp/çok düşük Kd
-        # olduğunda aşağıdaki unstable_drive treni bilerek titreştirir.
-        control = p.kp * err * 0.00075 + p.ki * self.integral * 0.00028 + p.kd * derivative * 0.000085
-        desired_acc = -control * 1200.0 / max(mass_load, 0.3)
-        weak_lift_sag = -70.0 * power_shortage
-        unstable_drive = math.sin(self.t * (5.0 + 3.0 * underdamped)) * (22.0 * max(0.0, self.instability_index - 0.55))
-        random_kick = random.gauss(0.0, 10.0 * p.noise * (1.0 + self.instability_index))
-        damping = (7.2 + 4.2 * p.guide + 0.65 * p.kd) * self.vgap
+        # PID çıkışı istenen dikey ivmeyi, dolayısıyla istenen manyetik kuvveti
+        # belirler. Pozitif gap hatası treni raydan fazla uzakta gösterir; bu durumda
+        # kaldırma azaltılır ve yerçekimi treni hedefe geri getirir.
+        pid_accel_mps2 = -(
+            p.kp * err * 0.00090
+            + p.ki * self.integral * 0.00035
+            + p.kd * derivative * 0.00010
+        )
+        desired_force = max(0.0, mass * (GRAVITY_MPS2 + pid_accel_mps2))
+        measured_gap_m = max(measured, MIN_GAP_MM) / 1000.0
+        desired_effective_current = measured_gap_m * math.sqrt(
+            desired_force / max(MAGNETIC_FORCE_CONSTANT, 1e-12)
+        )
+        desired_ratio = desired_effective_current / sat_i
+        if desired_ratio < 0.995:
+            desired_current = desired_effective_current / math.sqrt(max(1e-6, 1.0 - desired_ratio ** 2))
+        else:
+            desired_current = power_limit
+        self.command_current = clamp(desired_current, 0.0, power_limit)
+
+        # Bobin akımı anında hedefe sıçramaz. PWM sürücüsünün istediği akımı takip
+        # etmesi için gereken gerilim hesaplanır, bus voltajıyla sınırlandırılır ve
+        # L*dI/dt = V - R*I elektrik denklemi çözülür.
+        current_loop_tau = 0.045
+        requested_voltage = (
+            p.resistance * self.command_current
+            + COIL_INDUCTANCE_H * (self.command_current - self.current) / current_loop_tau
+        )
+        self.coil_voltage = clamp(requested_voltage, 0.0, self.bus_voltage)
+        di_dt = (self.coil_voltage - p.resistance * self.current) / COIL_INDUCTANCE_H
+        self.current = clamp(self.current + di_dt * dt, 0.0, max(power_limit, self.current))
+
+        # Manyetik doyum sonrası gerçek kuvvet; gap metre cinsindendir. Bu kuvvet
+        # doğrudan Newton'un ikinci yasasına girer.
+        self.saturation_ratio = clamp(self.current / sat_i, 0.0, 3.0)
+        self.effective_current = self.current / math.sqrt(1.0 + (self.current / sat_i) ** 2)
+        actual_gap_m = max(self.gap, MIN_GAP_MM) / 1000.0
+        self.magnetic_force = clamp(
+            MAGNETIC_FORCE_CONSTANT * self.effective_current ** 2 / max(actual_gap_m ** 2, 1e-9),
+            0.0,
+            MAX_MAGNETIC_FORCE_N,
+        )
+        self.gravity_force = mass * GRAVITY_MPS2
+        vertical_velocity_mps = self.vgap / 1000.0
+        damping_force = VERTICAL_DAMPING_NS_M * (1.0 + 0.35 * p.guide) * vertical_velocity_mps
+        disturbance_force = 0.0
         if self.disturb > 0:
-            unstable_drive += 85.0
+            disturbance_force = 0.08
             self.disturb -= dt
-        self.vgap += (desired_acc + weak_lift_sag + unstable_drive + random_kick - damping) * dt
-        # Kararlı sistemlerde hız küçük kalır; kötü sistemlerde sınır daha geniştir ki kullanıcı farkı görebilsin.
-        max_vgap = 24.0 + 24.0 * self.instability_index
-        self.vgap = clamp(self.vgap, -max_vgap, max_vgap)
+        self.vertical_accel = (
+            self.magnetic_force - self.gravity_force - damping_force + disturbance_force
+        ) / mass
+        self.vgap += self.vertical_accel * 1000.0 * dt
+        self.vgap = clamp(self.vgap, -900.0, 900.0)
         self.gap += self.vgap * dt
 
-        # Gap limits.
+        # Ray teması ve güvenli simülasyon sınırları.
         if self.gap < MIN_GAP_MM:
             self.gap = MIN_GAP_MM
-            self.vgap = max(0, self.vgap) * 0.25
+            self.vgap = max(0.0, self.vgap) * 0.15
         if self.gap > MAX_GAP_MM:
             self.gap = MAX_GAP_MM
-            self.vgap = min(0, self.vgap) * 0.25
+            self.vgap = min(0.0, self.vgap) * 0.15
 
         # Pitch/eğim: düşük stabilizer + yüksek hız + gürültü + kötü PID artık daha görünür eğim üretir.
         noise_pitch = random.gauss(0, p.noise * (0.22 + 0.12 * self.instability_index))
@@ -663,17 +728,8 @@ class MaglevSim:
         self.pitch += self.vpitch * dt
         self.pitch = clamp(self.pitch, -12.0, 12.0)
 
-        # Current and heating. Kötü durumda akım limite dayanır ve sıcaklık daha anlamlı yükselir.
-        wanted_current = required_current + abs(err) * 0.26 + abs(self.vgap) * 0.010 + 0.38 * self.instability_index
-        self.current += (clamp(wanted_current, 0, power_limit) - self.current) * min(1.0, dt * (5.5 + self.instability_index))
-        # V11 manyetik doyum: akım artsa bile manyetik etki sınırsız artmaz.
-        sat_i = max(0.2, p.saturation_current)
-        self.saturation_ratio = clamp(self.current / sat_i, 0.0, 3.0)
-        self.effective_current = self.current / math.sqrt(1.0 + (self.current / sat_i) ** 2)
-        saturation_loss = max(0.0, self.current - self.effective_current)
-        # Doyum varsa kaldırma zayıflar; gap ve pitch tarafında ek kararsızlık oluşsun.
-        self.vgap += (saturation_loss * 1.6 + max(0.0, self.saturation_ratio - 0.85) * 9.0) * dt
-        self.vpitch += max(0.0, self.saturation_ratio - 0.9) * 0.45 * dt
+        # Akım fizik modelinde yukarıda hesaplandı; burada yalnızca elektriksel ısı
+        # kaybı ve soğutma modeli uygulanır.
         heating = (self.current ** 2) * p.resistance * (0.030 + 0.006 * self.instability_index)
         # V11 soğutma: fan/ısı emici etkisini temsil eder.
         cooling = (self.temp - 25.0) * (0.012 + 0.010 * p.friction) * max(0.15, p.cooling_factor)
@@ -775,6 +831,11 @@ class MaglevSim:
                 "status": self.status,
                 "instability_index": round(self.instability_index, 4),
                 "effective_current_A": round(self.effective_current, 4),
+                "command_current_A": round(self.command_current, 4),
+                "coil_voltage_V": round(self.coil_voltage, 4),
+                "magnetic_force_N": round(self.magnetic_force, 5),
+                "gravity_force_N": round(self.gravity_force, 5),
+                "vertical_accel_mps2": round(self.vertical_accel, 5),
                 "bus_voltage_V": round(self.bus_voltage, 4),
                 "thermal_derate": round(self.thermal_derate, 4),
                 "saturation_ratio": round(self.saturation_ratio, 4),
@@ -2054,7 +2115,7 @@ class App:
             ("Hız", f"{self.sim.vx:.2f} m/s", BLUE),
             ("Sıcaklık", f"{self.sim.temp:.1f} °C", ORANGE),
             ("Akım", f"{self.sim.current:.2f} A", PURPLE),
-            ("Pozisyon", f"{self.sim.x:.2f} m", CYAN),
+            ("Kaldırma", f"{self.sim.magnetic_force:.2f} N", CYAN),
         ]
         gap = 10
         w = int((r.w - gap * (len(metrics) + 1)) / len(metrics))
