@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-MAGLEV TRAIN VISUAL SIMULATION - V14 DUAL MAGNET MODEL
+MAGLEV TRAIN VISUAL SIMULATION - V15 ROBUST PID MODEL
 ------------------------------------------------
 Bu sürümün amacı: sadece çalışan bir demo değil, yeni başlayan birinin de
 hangi ayarın neyi değiştirdiğini rahat okuyabildiği kullanıcı dostu bir
 simülasyon ekranı sunmak.
 
-V14; ön ve arka elektromıknatısları, sensörleri ve PID kanallarını ayrı ayrı
-hesaplar. Pitch hareketi iki kaldırma kuvveti arasındaki gerçek torktan oluşur.
+V15; çift elektromıknatıs modeline türev filtresi, derivative-on-measurement,
+anti-windup ve hedef boşluk rampası ekler.
 
 Çalıştırma:
     py maglev_pygame_v12_final_demo.py
@@ -47,7 +47,7 @@ import pygame
 # ============================================================
 
 APP_TITLE = "Maglev Train Visual Simulation"
-VERSION = "v14.0-dual-magnet"
+VERSION = "v15.0-robust-pid"
 FPS = 60
 
 # Dikey hareket modeli sabitleri
@@ -281,6 +281,27 @@ INFO: Dict[str, Dict[str, str]] = {
         "down": "Azalırsa ağır çekim gibi olur; öğrenmek için idealdir.",
         "watch": "Sağdaki değerleri okuyabildiğin seviyeyi seç.",
     },
+    "derivative_filter_hz": {
+        "title": "Türev Filtresi",
+        "what": "Kd terimine giden ölçüm hızındaki yüksek frekanslı sensör gürültüsünü süzer.",
+        "up": "Bant genişliği artar; kontrol daha hızlı ama gürültüye daha hassas tepki verir.",
+        "down": "Ölçüm daha fazla yumuşar; akım titreşimi azalır ancak tepki gecikebilir.",
+        "watch": "Ön/arka akım dalgalanması ile hedefe dönüş süresini birlikte izle.",
+    },
+    "anti_windup_gain": {
+        "title": "Anti-Windup Kazancı",
+        "what": "Akım sınırına gelindiğinde integral teriminin birikmesini engeller.",
+        "up": "Integral daha hızlı boşalır; doyum sonrası toparlanma hızlanır.",
+        "down": "Integral daha yavaş boşalır; yüksek Ki değerlerinde taşma görülebilir.",
+        "watch": "Akım limitinden çıktıktan sonra boşluk hızla toparlanıyor mu?",
+    },
+    "setpoint_ramp": {
+        "title": "Hedef Rampa Hızı",
+        "what": "Hedef boşluğun ani sıçramak yerine saniyede kaç mm değişeceğini belirler.",
+        "up": "Yeni hedefe daha hızlı geçilir; akım ve ivme sıçraması büyüyebilir.",
+        "down": "Geçiş yumuşar; yeni hedefe ulaşmak daha uzun sürer.",
+        "watch": "Kontrol hedefi, akım ve boşluk eğrilerinin yumuşaklığını izle.",
+    },
 }
 
 
@@ -493,6 +514,9 @@ CHANGE_EFFECTS.update({
     "cooling_factor": {"increase": "Soğutma etkisi arttı; bobin daha geç ısınır.", "decrease": "Soğutma etkisi azaldı; termal koruma daha hızlı devreye girebilir.", "watch": "Sıcaklık eğrisinin eğimine bak."},
     "calibration_gain": {"increase": "Kalibrasyon kazancı arttı; gerçek ölçüm daha büyük yorumlanır.", "decrease": "Kalibrasyon kazancı azaldı; gerçek ölçüm daha küçük yorumlanır.", "watch": "Gerçek-simülasyon gap farkı azalıyor mu?"},
     "calibration_offset": {"increase": "Ofset arttı; tüm sensör ölçümü yukarı kayar.", "decrease": "Ofset azaldı; tüm sensör ölçümü aşağı kayar.", "watch": "Ortalama gap farkı sıfıra yaklaştı mı?"},
+    "derivative_filter_hz": {"increase": "Türev filtresi hızlandı; tepki çabuklaşır fakat gürültü akıma daha çok yansıyabilir.", "decrease": "Türev daha fazla süzülür; akım sakinleşir fakat tepki gecikebilir.", "watch": "Akım titreşimi ile yerleşme süresini karşılaştır."},
+    "anti_windup_gain": {"increase": "Doyumda biriken integral daha hızlı boşaltılır.", "decrease": "Integral daha yavaş boşalır; akım limitinden sonra aşım artabilir.", "watch": "Akım sınırından çıktıktan sonraki toparlanmayı izle."},
+    "setpoint_ramp": {"increase": "Kontrol hedefi daha hızlı değişir; geçiş sertleşebilir.", "decrease": "Hedef geçişi yumuşar ancak daha uzun sürer.", "watch": "Kontrol hedefi, akım ve boşluk eğrilerini birlikte izle."},
 })
 
 # ============================================================
@@ -509,6 +533,9 @@ class Params:
     kp: float = 210.0
     ki: float = 0.0
     kd: float = 3.2
+    derivative_filter_hz: float = 12.0
+    anti_windup_gain: float = 0.8
+    setpoint_ramp: float = 6.0
     voltage: float = 12.0
     resistance: float = 2.0
     current_limit: float = 6.0
@@ -551,6 +578,14 @@ class MaglevSim:
         self.integral_rear = 0.0
         self.prev_err_front = 0.0
         self.prev_err_rear = 0.0
+        self.controller_target = None
+        self.prev_measurement_front = self.front_gap
+        self.prev_measurement_rear = self.rear_gap
+        self.filtered_derivative_front = 0.0
+        self.filtered_derivative_rear = 0.0
+        self.front_current_saturated = False
+        self.rear_current_saturated = False
+        self.anti_windup_active = False
         self.active_coil = 0
         self.status = "KARARLI"
         self.disturb = 0.0
@@ -604,6 +639,14 @@ class MaglevSim:
 
         mass = max(p.mass / 1000.0, 0.05)
         target = p.target_gap
+        if self.controller_target is None:
+            self.controller_target = target
+        else:
+            max_target_step = max(0.05, p.setpoint_ramp) * dt
+            self.controller_target += clamp(
+                target - self.controller_target, -max_target_step, max_target_step
+            )
+        control_target = self.controller_target
 
         # Gövdenin ön ve arka süspansiyon noktalarındaki gerçek boşluklar.
         half_length_m = TRAIN_LEN_M * 0.5
@@ -651,21 +694,39 @@ class MaglevSim:
         self.last_measured_rear = measured_rear
         measured = 0.5 * (measured_front + measured_rear)
         self.last_measured_gap = measured
-        err_front = measured_front - target
-        err_rear = measured_rear - target
+        err_front = measured_front - control_target
+        err_rear = measured_rear - control_target
         err = 0.5 * (err_front + err_rear)
 
         # ----------------------------------------------------
         # PID + fizik tabanlı kaldırma modeli
         # ----------------------------------------------------
-        self.integral_front = clamp(self.integral_front + err_front * dt, -6.0, 6.0)
-        self.integral_rear = clamp(self.integral_rear + err_rear * dt, -6.0, 6.0)
-        derivative_front = clamp((err_front - self.prev_err_front) / max(dt, 1e-5), -160, 160)
-        derivative_rear = clamp((err_rear - self.prev_err_rear) / max(dt, 1e-5), -160, 160)
+        candidate_integral_front = clamp(self.integral_front + err_front * dt, -6.0, 6.0)
+        candidate_integral_rear = clamp(self.integral_rear + err_rear * dt, -6.0, 6.0)
+
+        # Türev hedef hatasından değil doğrudan ölçümden alınır. Böylece hedef
+        # değişiminde derivative kick oluşmaz. Birinci dereceden alçak geçiren
+        # filtre sensör gürültüsünün Kd üzerinden akıma taşınmasını azaltır.
+        raw_derivative_front = clamp(
+            (measured_front - self.prev_measurement_front) / max(dt, 1e-5), -160.0, 160.0
+        )
+        raw_derivative_rear = clamp(
+            (measured_rear - self.prev_measurement_rear) / max(dt, 1e-5), -160.0, 160.0
+        )
+        filter_tau = 1.0 / (2.0 * math.pi * max(0.1, p.derivative_filter_hz))
+        filter_alpha = dt / (filter_tau + dt)
+        self.filtered_derivative_front += filter_alpha * (
+            raw_derivative_front - self.filtered_derivative_front
+        )
+        self.filtered_derivative_rear += filter_alpha * (
+            raw_derivative_rear - self.filtered_derivative_rear
+        )
+        self.prev_measurement_front = measured_front
+        self.prev_measurement_rear = measured_rear
+        derivative_front = self.filtered_derivative_front
+        derivative_rear = self.filtered_derivative_rear
         self.prev_err_front = err_front
         self.prev_err_rear = err_rear
-        self.integral = 0.5 * (self.integral_front + self.integral_rear)
-        derivative = 0.5 * (derivative_front + derivative_rear)
         self.prev_err = err
 
         mass_load = mass / 0.15
@@ -683,7 +744,7 @@ class MaglevSim:
 
         # Hedef boşlukta ağırlığı dengelemek için gereken akım fizik denkleminden
         # hesaplanır. Doyum modeli nedeniyle bobin akımı ile efektif akım farklıdır.
-        target_gap_m = max(target, MIN_GAP_MM) / 1000.0
+        target_gap_m = max(control_target, MIN_GAP_MM) / 1000.0
         required_effective_current = target_gap_m * math.sqrt(
             0.5 * mass * GRAVITY_MPS2 / max(MAGNETIC_FORCE_CONSTANT, 1e-12)
         )
@@ -716,8 +777,8 @@ class MaglevSim:
                 + p.kd * deriv * 0.00010
             )
 
-        pid_accel_front = pid_accel(err_front, self.integral_front, derivative_front)
-        pid_accel_rear = pid_accel(err_rear, self.integral_rear, derivative_rear)
+        pid_accel_front = pid_accel(err_front, candidate_integral_front, derivative_front)
+        pid_accel_rear = pid_accel(err_rear, candidate_integral_rear, derivative_rear)
 
         def force_to_current(gap_mm, desired_force):
             gap_m = max(gap_mm, MIN_GAP_MM) / 1000.0
@@ -726,17 +787,42 @@ class MaglevSim:
             )
             ratio = desired_effective / sat_i
             if ratio >= 0.995:
-                return power_limit
-            return clamp(
-                desired_effective / math.sqrt(max(1e-6, 1.0 - ratio ** 2)),
-                0.0,
-                power_limit,
-            )
+                unconstrained = power_limit + desired_effective
+            else:
+                unconstrained = desired_effective / math.sqrt(max(1e-6, 1.0 - ratio ** 2))
+            return clamp(unconstrained, 0.0, power_limit), unconstrained
 
         desired_force_front = 0.5 * mass * max(0.0, GRAVITY_MPS2 + pid_accel_front)
         desired_force_rear = 0.5 * mass * max(0.0, GRAVITY_MPS2 + pid_accel_rear)
-        self.command_current_front = force_to_current(measured_front, desired_force_front)
-        self.command_current_rear = force_to_current(measured_rear, desired_force_rear)
+        self.command_current_front, unconstrained_front = force_to_current(
+            measured_front, desired_force_front
+        )
+        self.command_current_rear, unconstrained_rear = force_to_current(
+            measured_rear, desired_force_rear
+        )
+        self.front_current_saturated = abs(unconstrained_front - self.command_current_front) > 1e-6
+        self.rear_current_saturated = abs(unconstrained_rear - self.command_current_rear) > 1e-6
+
+        # Conditional integration + integral bleed. Hata aktüatörü doygunluğa
+        # daha fazla itiyorsa integral büyütülmez ve mevcut birikim kontrollü azalır.
+        def anti_windup(old_integral, candidate, error, command, unconstrained):
+            upper_block = command >= power_limit - 1e-6 and unconstrained > command and error < 0.0
+            lower_block = command <= 1e-6 and error > 0.0
+            if upper_block or lower_block:
+                bleed = max(0.0, 1.0 - p.anti_windup_gain * dt)
+                return old_integral * bleed, True
+            return candidate, False
+
+        self.integral_front, front_aw = anti_windup(
+            self.integral_front, candidate_integral_front, err_front,
+            self.command_current_front, unconstrained_front
+        )
+        self.integral_rear, rear_aw = anti_windup(
+            self.integral_rear, candidate_integral_rear, err_rear,
+            self.command_current_rear, unconstrained_rear
+        )
+        self.anti_windup_active = front_aw or rear_aw
+        self.integral = 0.5 * (self.integral_front + self.integral_rear)
         self.command_current = 0.5 * (self.command_current_front + self.command_current_rear)
 
         # İki bobinin L*dI/dt = V-RI denklemi ayrı çözülür.
@@ -919,8 +1005,10 @@ class MaglevSim:
             self.export_rows.append({
                 "time_s": round(self.t, 4),
                 "target_gap_mm": round(p.target_gap, 4),
+                "controller_target_gap_mm": round(self.controller_target, 4),
                 "gap_mm": round(self.gap, 4),
                 "gap_error_mm": round(self.gap - p.target_gap, 4),
+                "controller_gap_error_mm": round(self.gap - self.controller_target, 4),
                 "front_gap_mm": round(self.front_gap, 4),
                 "rear_gap_mm": round(self.rear_gap, 4),
                 "measured_front_gap_mm": round(self.last_measured_front, 4),
@@ -941,6 +1029,13 @@ class MaglevSim:
                 "command_current_A": round(self.command_current, 4),
                 "front_command_current_A": round(self.command_current_front, 4),
                 "rear_command_current_A": round(self.command_current_rear, 4),
+                "front_filtered_derivative_mm_s": round(self.filtered_derivative_front, 5),
+                "rear_filtered_derivative_mm_s": round(self.filtered_derivative_rear, 5),
+                "front_integral_mm_s": round(self.integral_front, 5),
+                "rear_integral_mm_s": round(self.integral_rear, 5),
+                "front_current_saturated": int(self.front_current_saturated),
+                "rear_current_saturated": int(self.rear_current_saturated),
+                "anti_windup_active": int(self.anti_windup_active),
                 "coil_voltage_V": round(self.coil_voltage, 4),
                 "front_coil_voltage_V": round(self.coil_voltage_front, 4),
                 "rear_coil_voltage_V": round(self.coil_voltage_rear, 4),
@@ -959,6 +1054,9 @@ class MaglevSim:
                 "kp": round(p.kp, 4),
                 "ki": round(p.ki, 4),
                 "kd": round(p.kd, 4),
+                "derivative_filter_hz": round(p.derivative_filter_hz, 4),
+                "anti_windup_gain": round(p.anti_windup_gain, 4),
+                "setpoint_ramp_mm_s": round(p.setpoint_ramp, 4),
                 "voltage_V": round(p.voltage, 4),
                 "resistance_ohm": round(p.resistance, 4),
                 "current_limit_A": round(p.current_limit, 4),
@@ -1067,6 +1165,9 @@ class App:
         add("kp", "Kp", 0, 900, 210, 5, "", "PID Kontrol")
         add("ki", "Ki", 0, 80, 0, 1, "", "PID Kontrol")
         add("kd", "Kd", 0, 18, 3.2, 0.1, "", "PID Kontrol")
+        add("derivative_filter_hz", "Türev filtresi", 1.0, 40.0, 12.0, 1.0, "Hz", "PID Kontrol")
+        add("anti_windup_gain", "Anti-windup", 0.0, 3.0, 0.8, 0.1, "", "PID Kontrol")
+        add("setpoint_ramp", "Hedef rampa hızı", 0.5, 30.0, 6.0, 0.5, "mm/s", "PID Kontrol")
         add("voltage", "Voltaj", 6, 24, 12, 0.5, "V", "Güç ve Bobin")
         add("resistance", "Bobin direnci", 0.5, 5.0, 2.0, 0.1, "Ω", "Güç ve Bobin")
         add("current_limit", "Maks. akım limiti", 1.0, 12.0, 6.0, 0.5, "A", "Güç ve Bobin")
@@ -2116,10 +2217,11 @@ class App:
                 pygame.draw.line(self.screen, GRID, (r.x, y), (r.right, y), 1)
                 text(self.screen, self.fonts["tiny"], f"{mm}", r.x + 10, y - 8, FAINT)
         text(self.screen, self.fonts["tiny"], "Boşluk (mm)", r.x + 10, r.y + 14, MUTED)
-        # target line
-        ty = int(self.track_y - p.target_gap * self.px_per_mm)
+        # Yumuşatılmış kontrol hedefi; slider hedefi bu çizgiye rampa ile gelir.
+        control_target = self.sim.controller_target if self.sim.controller_target is not None else p.target_gap
+        ty = int(self.track_y - control_target * self.px_per_mm)
         pygame.draw.line(self.screen, CYAN, (r.x + 1, ty), (r.right - 1, ty), 1)
-        text(self.screen, self.fonts["tiny"], "- - Hedef boşluk", r.right - 145, r.y + 18, CYAN)
+        text(self.screen, self.fonts["tiny"], "- - Kontrol hedefi", r.right - 145, r.y + 18, CYAN)
 
         self.draw_track()
         self.draw_coils()
@@ -2246,7 +2348,7 @@ class App:
         rounded(self.screen, (12, 22, 36), r, 12)
         rounded(self.screen, BORDER, r, 12, 1)
         metrics = [
-            ("Hedef Boşluk", f"{p.target_gap:.2f} mm", CYAN),
+            ("Kontrol Hedefi", f"{(self.sim.controller_target if self.sim.controller_target is not None else p.target_gap):.2f} mm", CYAN),
             ("Gerçek Boşluk", f"{self.sim.gap:.2f} mm", GREEN),
             ("Hız", f"{self.sim.vx:.2f} m/s", BLUE),
             ("Sıcaklık", f"{self.sim.temp:.1f} °C", ORANGE),
@@ -2350,7 +2452,7 @@ class App:
             ("Arka Gap", f"{self.sim.rear_gap:.2f} mm", TEXT),
             ("Pitch", f"{self.sim.pitch:+.2f}°", TEXT),
             ("Hız", f"{self.sim.vx:.2f} m/s", TEXT),
-            ("Pozisyon", f"{self.sim.x:.2f} m", TEXT),
+            ("PID Koruma", "ANTI-WINDUP" if self.sim.anti_windup_active else "FİLTRELİ", ORANGE if self.sim.anti_windup_active else GREEN),
             ("Ort. Akım", f"{self.sim.current:.2f} A", PURPLE),
             ("Sıcaklık", f"{self.sim.temp:.1f} °C", ORANGE),
             ("Bobin", f"Aktif #{self.sim.active_coil+1}", TEXT),
