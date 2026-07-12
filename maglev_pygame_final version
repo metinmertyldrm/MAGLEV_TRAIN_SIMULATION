@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-MAGLEV TRAIN VISUAL SIMULATION - V15 ROBUST PID MODEL
+MAGLEV TRAIN VISUAL SIMULATION - V16 DUAL PHYSICS MODE
 ------------------------------------------------
 Bu sürümün amacı: sadece çalışan bir demo değil, yeni başlayan birinin de
 hangi ayarın neyi değiştirdiğini rahat okuyabildiği kullanıcı dostu bir
 simülasyon ekranı sunmak.
 
-V15; çift elektromıknatıs modeline türev filtresi, derivative-on-measurement,
-anti-windup ve hedef boşluk rampası ekler.
+V16; eğitim için etkileri belirginleştiren Demo modu ile sentetik kuvvet
+kullanmayan Mühendislik modunu birbirinden ayırır.
 
 Çalıştırma:
     py maglev_pygame_v12_final_demo.py
@@ -26,6 +26,7 @@ Kısayollar:
     G     : grafikleri aç/kapat
     H     : yardım kartını aç/kapat
     M     : başlangıç/gelişmiş mod değiştir
+    E     : demo/mühendislik fizik modu değiştir
     ESC   : çıkış
 """
 
@@ -47,7 +48,7 @@ import pygame
 # ============================================================
 
 APP_TITLE = "Maglev Train Visual Simulation"
-VERSION = "v15.0-robust-pid"
+VERSION = "v16.0-dual-physics-mode"
 FPS = 60
 
 # Dikey hareket modeli sabitleri
@@ -593,6 +594,11 @@ class MaglevSim:
         self.history: Dict[str, List[float]] = {k: [] for k in ["gap", "pitch", "speed", "current", "temp"]}
         self.derailed = False
         self.instability_index = 0.0
+        self.heuristic_instability_index = 0.0
+        self.physical_risk_index = 0.0
+        self.synthetic_force = 0.0
+        self.synthetic_torque = 0.0
+        self.model_mode = "ENGINEERING"
         self.warning_reason = ""
         # Senaryo verileri: simülasyon başladığı/resetlendiği andan kaydet butonuna kadar tutulur.
         self.export_rows: List[Dict[str, float]] = []
@@ -633,9 +639,10 @@ class MaglevSim:
     def coils(self, count=12):
         return [0.08 + i * (TRACK_LEN_M - 0.16) / (count - 1) for i in range(count)]
 
-    def step(self, dt, p: Params):
+    def step(self, dt, p: Params, engineering_mode=True):
         dt *= clamp(p.sim_speed, 0.05, 1.0)
         self.t += dt
+        self.model_mode = "ENGINEERING" if engineering_mode else "DEMO"
 
         mass = max(p.mass / 1000.0, 0.05)
         target = p.target_gap
@@ -763,9 +770,29 @@ class MaglevSim:
         guide_weak = max(0.0, (0.65 - p.guide) / 0.65)
         speed_risk = max(0.0, (p.propulsion - 0.34) / 0.36) + max(0.0, (p.max_speed - 0.65) / 0.55)
         target_risk = max(0.0, (target - 12.0) / 6.0)
-        self.instability_index = clamp(
+        self.heuristic_instability_index = clamp(
             0.95 * underdamped + 1.15 * power_shortage + 0.65 * noise_factor + 0.75 * guide_weak + 0.55 * speed_risk + 0.35 * target_risk + 0.25 * excessive_damping,
             0.0, 4.0
+        )
+        gap_risk = abs(self.gap - control_target) / max(1.0, control_target * 0.35)
+        pitch_risk = abs(self.pitch) / 5.0
+        thermal_risk = max(0.0, (self.temp - p.thermal_limit) / 20.0)
+        current_risk = max(
+            0.0,
+            max(self.current_front, self.current_rear) / max(power_limit, 0.1) - 0.85,
+        )
+        self.physical_risk_index = clamp(
+            1.25 * power_shortage
+            + 0.70 * gap_risk
+            + 0.55 * pitch_risk
+            + 0.55 * thermal_risk
+            + 0.45 * current_risk
+            + (0.55 if self.sensor_fault_active else 0.0),
+            0.0,
+            4.0,
+        )
+        self.instability_index = (
+            self.physical_risk_index if engineering_mode else self.heuristic_instability_index
         )
 
         # Ön ve arka kontrolcüler aynı hedef boşluğu izler ancak kendi sensör,
@@ -876,8 +903,21 @@ class MaglevSim:
         if self.disturb > 0:
             disturbance_force = 0.08
             self.disturb -= dt
+        self.synthetic_force = 0.0
+        self.synthetic_torque = 0.0
+        if not engineering_mode:
+            demo_level = max(0.0, self.heuristic_instability_index - 0.55)
+            self.synthetic_force = (
+                mass * 0.12 * demo_level
+                * math.sin(self.t * (5.0 + 2.0 * underdamped))
+            )
+            self.synthetic_torque = (
+                0.0018 * max(0.0, self.heuristic_instability_index - 0.65)
+                * math.sin(self.t * 3.1)
+            )
         self.vertical_accel = (
-            self.magnetic_force - self.gravity_force - damping_force + disturbance_force
+            self.magnetic_force - self.gravity_force - damping_force
+            + disturbance_force + self.synthetic_force
         ) / mass
         self.vgap += self.vertical_accel * 1000.0 * dt
         self.vgap = clamp(self.vgap, -900.0, 900.0)
@@ -887,7 +927,7 @@ class MaglevSim:
         moment_of_inertia = max(mass * TRAIN_LEN_M ** 2 / 12.0, 1e-5)
         magnetic_torque = (
             self.magnetic_force_front - self.magnetic_force_rear + disturbance_force
-        ) * half_length_m
+        ) * half_length_m + self.synthetic_torque
         damping_torque = ANGULAR_DAMPING_NMS_RAD * (1.0 + p.guide) * self.vpitch
         guide_torque = GUIDE_STIFFNESS_NM_RAD * p.guide * self.pitch_rad
         angular_accel = (magnetic_torque - damping_torque - guide_torque) / moment_of_inertia
@@ -917,7 +957,8 @@ class MaglevSim:
         # Akım fizik modelinde yukarıda hesaplandı; burada yalnızca elektriksel ısı
         # kaybı ve soğutma modeli uygulanır.
         mean_current_sq = 0.5 * (self.current_front ** 2 + self.current_rear ** 2)
-        heating = mean_current_sq * p.resistance * (0.030 + 0.006 * self.instability_index)
+        demo_heat = 0.006 * self.heuristic_instability_index if not engineering_mode else 0.0
+        heating = mean_current_sq * p.resistance * (0.030 + demo_heat)
         # V11 soğutma: fan/ısı emici etkisini temsil eder.
         cooling = (self.temp - 25.0) * (0.012 + 0.010 * p.friction) * max(0.15, p.cooling_factor)
         self.temp += (heating - cooling) * dt
@@ -941,12 +982,18 @@ class MaglevSim:
         drag = p.friction * self.vx * abs(self.vx)
         ax = (force - drag) / mass
         self.vx += ax * dt
-        # Çok agresif itki + düşük kılavuzda raydan çıkma riski oluşsun.
-        speed_cap = p.max_speed * (1.0 + 0.30 * max(0.0, self.instability_index - 1.0))
+        # Demo modunda risk görünür olsun diye hız sınırı esneyebilir. Mühendislik
+        # modunda kullanıcının seçtiği sınır aynen uygulanır.
+        speed_cap = p.max_speed
+        if not engineering_mode:
+            speed_cap *= 1.0 + 0.30 * max(0.0, self.heuristic_instability_index - 1.0)
         self.vx = clamp(self.vx, -0.10, speed_cap)
         self.x += self.vx * dt
         if self.x > TRACK_LEN_M:
-            if self.instability_index > 1.35 or abs(self.pitch) > 7.5 or self.vx > 0.75:
+            if engineering_mode:
+                self.x = TRACK_LEN_M
+                self.vx = 0.0
+            elif self.heuristic_instability_index > 1.35 or abs(self.pitch) > 7.5 or self.vx > 0.75:
                 self.derailed = True
                 self.x = TRACK_LEN_M
                 self.vx = 0
@@ -981,9 +1028,9 @@ class MaglevSim:
             self.status = "MANYETİK DOYUM"
         elif abs(self.gap - target) > 2.4:
             self.status = "BOŞLUK UYARISI"
-        elif self.instability_index > 1.25:
+        elif not engineering_mode and self.heuristic_instability_index > 1.25:
             self.status = "KARARSIZ"
-        elif self.instability_index > 0.75:
+        elif not engineering_mode and self.heuristic_instability_index > 0.75:
             self.status = "SALINIM"
         else:
             self.status = "KARARLI"
@@ -1020,7 +1067,12 @@ class MaglevSim:
                 "position_m": round(self.x, 4),
                 "active_coil": int(self.active_coil + 1),
                 "status": self.status,
+                "model_mode": self.model_mode,
                 "instability_index": round(self.instability_index, 4),
+                "heuristic_instability_index": round(self.heuristic_instability_index, 4),
+                "physical_risk_index": round(self.physical_risk_index, 4),
+                "synthetic_force_N": round(self.synthetic_force, 6),
+                "synthetic_torque_Nm": round(self.synthetic_torque, 6),
                 "effective_current_A": round(self.effective_current, 4),
                 "front_current_A": round(self.current_front, 4),
                 "rear_current_A": round(self.current_rear, 4),
@@ -1096,6 +1148,7 @@ class App:
         self.show_graphs = True
         self.show_help = True
         self.beginner_mode = True
+        self.engineering_mode = False
         self.scroll = 0
         self.max_scroll = 0
         self.selected_key = "kp"
@@ -1123,6 +1176,8 @@ class App:
         self.calibration_report: str = "Henüz gerçek veri içe aktarılmadı."
         self.mode_beginner_rect = pygame.Rect(0, 0, 1, 1)
         self.mode_advanced_rect = pygame.Rect(0, 0, 1, 1)
+        self.physics_demo_rect = pygame.Rect(0, 0, 1, 1)
+        self.physics_engineering_rect = pygame.Rect(0, 0, 1, 1)
         self.message = "Hazır"
         self.message_timer = 0
         self.sim = MaglevSim()
@@ -1259,6 +1314,15 @@ class App:
         self.change_log.clear()
         self.toast("Simülasyon sıfırlandı")
 
+    def set_physics_mode(self, engineering: bool):
+        if self.engineering_mode == engineering:
+            return
+        self.engineering_mode = engineering
+        self.sim.reset()
+        self.change_log.clear()
+        mode = "Mühendislik" if engineering else "Demo"
+        self.toast(f"{mode} fizik modu açıldı; senaryo sıfırlandı")
+
     def toast(self, msg):
         self.message = msg
         self.message_timer = 2.0
@@ -1271,6 +1335,7 @@ class App:
                 "max_overshoot_mm": 0.0, "settling_time_s": 0.0, "max_current_A": 0.0,
                 "max_temp_C": 0.0, "max_pitch_deg": 0.0, "energy_J_est": 0.0,
                 "stability_score": 0.0, "sensor_fault_count": 0, "thermal_protection_time_s": 0.0, "max_saturation_ratio": 0.0,
+                "max_physical_risk_index": 0.0, "max_heuristic_instability_index": 0.0,
             }
         errors = [abs(r.get("gap_error_mm", r["gap_mm"] - r.get("target_gap_mm", 8.0))) for r in rows]
         signed_errors = [r.get("gap_error_mm", r["gap_mm"] - r.get("target_gap_mm", 8.0)) for r in rows]
@@ -1286,6 +1351,8 @@ class App:
         max_temp = max(r["temperature_C"] for r in rows)
         max_pitch = max(abs(r["pitch_deg"]) for r in rows)
         max_instability = max(float(r.get("instability_index", 0.0)) for r in rows)
+        max_physical_risk = max(float(r.get("physical_risk_index", 0.0)) for r in rows)
+        max_heuristic_instability = max(float(r.get("heuristic_instability_index", 0.0)) for r in rows)
         max_saturation = max(float(r.get("saturation_ratio", 0.0)) for r in rows)
         sensor_fault_count = max(int(float(r.get("sensor_fault_count", 0))) for r in rows)
         thermal_protection_time = max(float(r.get("thermal_protection_time_s", 0.0)) for r in rows)
@@ -1330,6 +1397,8 @@ class App:
             "max_pitch_deg": round(max_pitch, 4),
             "energy_J_est": round(energy, 4),
             "max_instability_index": round(max_instability, 4),
+            "max_physical_risk_index": round(max_physical_risk, 4),
+            "max_heuristic_instability_index": round(max_heuristic_instability, 4),
             "bad_status_ratio": round(bad_status_ratio, 4),
             "sensor_fault_count": sensor_fault_count,
             "thermal_protection_time_s": round(thermal_protection_time, 4),
@@ -1570,6 +1639,7 @@ class App:
             "version": VERSION,
             "created_at": stamp,
             "preset": self.preset_name,
+            "physics_mode": "Mühendislik" if self.engineering_mode else "Demo",
             "duration_s": metrics["duration_s"],
             "parameters": params,
             "metrics": metrics,
@@ -1588,6 +1658,7 @@ class App:
             "MAGLEV SENARYO RAPORU",
             "======================",
             f"Preset: {self.preset_name}",
+            f"Fizik modu: {'Mühendislik' if self.engineering_mode else 'Demo'}",
             f"Süre: {metrics['duration_s']:.2f} s",
             "",
             "Performans:",
@@ -1600,6 +1671,8 @@ class App:
             f"- Maksimum pitch: {metrics['max_pitch_deg']:.3f}°",
             f"- Tahmini enerji: {metrics['energy_J_est']:.3f} J",
             f"- Maksimum kararsızlık indeksi: {metrics.get('max_instability_index', 0):.3f}",
+            f"- Maksimum fiziksel risk indeksi: {metrics.get('max_physical_risk_index', 0):.3f}",
+            f"- Maksimum demo heuristik indeksi: {metrics.get('max_heuristic_instability_index', 0):.3f}",
             f"- Maksimum manyetik doyum oranı: {metrics.get('max_saturation_ratio', 0):.3f}",
             f"- Sensör arıza sayısı: {metrics.get('sensor_fault_count', 0)}",
             f"- Termal koruma süresi: {metrics.get('thermal_protection_time_s', 0):.2f} s",
@@ -1651,6 +1724,7 @@ class App:
             "name": scenario_dir.name,
             "created_at": scenario_dir.name.replace("scenario_", ""),
             "preset": "Bilinmiyor",
+            "physics_mode": "Bilinmiyor",
             "metrics": {},
         }
         try:
@@ -1671,7 +1745,8 @@ class App:
         info = self.scenario_summary(scenario_dir)
         created = str(info.get("created_at", scenario_dir.name.replace("scenario_", "")))
         preset = str(info.get("preset", "Senaryo"))
-        return f"{preset} | {created}"
+        mode = str(info.get("physics_mode", ""))
+        return f"{preset} / {mode} | {created}" if mode else f"{preset} | {created}"
 
     def open_compare_picker(self):
         self.compare_scenarios = self.saved_scenario_dirs()
@@ -1962,7 +2037,8 @@ class App:
         surf = pygame.Surface((1600, 1050))
         surf.fill(BG)
         text(surf, self.fonts["title"], "Maglev Train Visual Simulation - Senaryo Grafikleri", 40, 28, TEXT)
-        text(surf, self.fonts["small"], f"Preset: {self.preset_name} | Süre: {metrics['duration_s']:.2f}s | Kayıt sayısı: {len(rows)}", 40, 62, MUTED)
+        mode = "Mühendislik" if self.engineering_mode else "Demo"
+        text(surf, self.fonts["small"], f"Preset: {self.preset_name} | Fizik: {mode} | Süre: {metrics['duration_s']:.2f}s | Kayıt: {len(rows)}", 40, 62, MUTED)
         cards = [
             ("Kararlılık", f"{metrics['stability_score']:.1f}/100", GREEN if metrics['stability_score'] >= 75 else ORANGE),
             ("Ort. hata", f"{metrics['avg_abs_error_mm']:.3f} mm", CYAN),
@@ -1991,7 +2067,8 @@ class App:
         surf = pygame.Surface((1200, 720))
         surf.fill(BG)
         text(surf, self.fonts["title"], title, 42, 28, TEXT)
-        text(surf, self.fonts["small"], f"Senaryo: {self.preset_name} | Süre: {self.compute_metrics()['duration_s']:.2f}s", 42, 62, MUTED)
+        mode = "Mühendislik" if self.engineering_mode else "Demo"
+        text(surf, self.fonts["small"], f"Senaryo: {self.preset_name} | Fizik: {mode} | Süre: {self.compute_metrics()['duration_s']:.2f}s", 42, 62, MUTED)
         self.draw_png_chart(surf, pygame.Rect(42, 96, 1116, 570), title, rows, y_key, target_key, color, unit)
         pygame.image.save(surf, str(path))
 
@@ -2028,6 +2105,8 @@ class App:
                 self.beginner_mode = not self.beginner_mode
                 self.scroll = 0
                 self.toast("Başlangıç modu" if self.beginner_mode else "Gelişmiş mod")
+            if ev.key == pygame.K_e:
+                self.set_physics_mode(not self.engineering_mode)
             if ev.key == pygame.K_i:
                 self.import_real_data()
             if ev.key == pygame.K_c:
@@ -2052,6 +2131,12 @@ class App:
                 self.beginner_mode = False
                 self.scroll = 0
                 self.toast("Gelişmiş mod açıldı")
+                return True
+            if self.physics_demo_rect.collidepoint(ev.pos):
+                self.set_physics_mode(False)
+                return True
+            if self.physics_engineering_rect.collidepoint(ev.pos):
+                self.set_physics_mode(True)
                 return True
         for k in self.visible_slider_keys():
             s = self.sliders[k]
@@ -2164,6 +2249,18 @@ class App:
             text(self.screen, self.fonts["tiny"], "Sadece en önemli ayarlar gösteriliyor. Tam liste için Gelişmiş.", x, y, MUTED)
             y += 22
 
+        text(self.screen, self.fonts["small"], "FİZİK MOTORU", x, y, BLUE)
+        y += 22
+        self.physics_demo_rect = pygame.Rect(x, y, bw, bh)
+        self.physics_engineering_rect = pygame.Rect(x + bw + 10, y, bw, bh)
+        rounded(self.screen, ORANGE if not self.engineering_mode else CARD, self.physics_demo_rect, 9)
+        rounded(self.screen, GREEN if self.engineering_mode else CARD, self.physics_engineering_rect, 9)
+        rounded(self.screen, ORANGE if not self.engineering_mode else BORDER, self.physics_demo_rect, 9, 1)
+        rounded(self.screen, GREEN if self.engineering_mode else BORDER, self.physics_engineering_rect, 9, 1)
+        text_center(self.screen, self.fonts["small"], "Demo", self.physics_demo_rect, WHITE)
+        text_center(self.screen, self.fonts["small"], "Mühendislik", self.physics_engineering_rect, WHITE)
+        y += bh + 12
+
         clip = pygame.Rect(0, y, self.left_w, self.h - y - 28)
         old_clip = self.screen.get_clip()
         self.screen.set_clip(clip)
@@ -2184,7 +2281,7 @@ class App:
         self.max_scroll = max(0, cy - (self.h - 28))
         self.screen.set_clip(old_clip)
 
-        text(self.screen, self.fonts["tiny"], "SPACE pause | R reset | D darbe | S fren | A vektör | G grafik | H yardım | M mod | I gerçek veri | C kalibre", 14, self.h - 22, FAINT)
+        text(self.screen, self.fonts["tiny"], "SPACE pause | R reset | D darbe | S fren | E fizik modu | M arayüz modu | I veri | C kalibre", 14, self.h - 22, FAINT)
 
     def draw_section_header(self, title, x, y):
         rounded(self.screen, (12, 22, 36), (x - 2, y, self.left_w - 28, 28), 8)
@@ -2198,6 +2295,12 @@ class App:
         rounded(self.screen, PANEL, (self.center_x, self.top_h + 8, self.center_w, self.h - self.top_h - 16), 12)
         rounded(self.screen, BORDER, (self.center_x, self.top_h + 8, self.center_w, self.h - self.top_h - 16), 12, 1)
         text(self.screen, self.fonts["h1"], "2D MAGLEV RAY SİMÜLASYONU", self.center_x + 18, self.top_h + 28, TEXT)
+        mode_label = "MÜHENDİSLİK" if self.engineering_mode else "DEMO"
+        mode_color = GREEN if self.engineering_mode else ORANGE
+        mode_badge = pygame.Rect(self.center_x + self.center_w - 142, self.top_h + 20, 122, 28)
+        rounded(self.screen, color_lerp(mode_color, BG, 0.65), mode_badge, 9)
+        rounded(self.screen, mode_color, mode_badge, 9, 1)
+        text_center(self.screen, self.fonts["tiny"], mode_label, mode_badge, mode_color)
         text(self.screen, self.fonts["small"], "Kaydır: yakınlaş/uzaklaş  |  Sürükle: görünümü kaydır", self.center_x + 18, self.top_h + 54, MUTED)
         self.draw_canvas(p)
         self.draw_bottom_status(p)
@@ -2720,7 +2823,7 @@ class App:
                 # a few substeps for smoother values
                 p = self.params()
                 for _ in range(2):
-                    self.sim.step(dt / 2, p)
+                    self.sim.step(dt / 2, p, self.engineering_mode)
             self.draw()
         pygame.quit()
 
